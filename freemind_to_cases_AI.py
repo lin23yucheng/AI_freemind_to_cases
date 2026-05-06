@@ -8,16 +8,16 @@ import requests
 import json
 import time
 import re
+from functools import lru_cache
 from dotenv import load_dotenv
 
 load_dotenv()  # 加载环境变量
 
 # ===== GLM-4配置 =====
 INCLUDE_PARENT = False  # 仅提取叶子节点
-FREEMIND_FILE = "算力管理平台V1-3测试点.mm"
-ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY")  # 需在.env中配置
-API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"  # GLM-4同步接口
-MODEL = "glm-4-plus"  # 替换为你要使用的模型编码
+FREEMIND_FILE = "一休云6-2需求测试点.mm"
+DEFAULT_PROVIDER = "zhipu"
+SUPPORTED_PROVIDERS = {"zhipu", "github", "openai_compatible"}
 
 cases_format = {
     "所属模块": "",
@@ -37,6 +37,96 @@ FIELD_MAPPING = {
     "步骤": ["步骤", "steps", "procedure", "操作步骤"],
     "预期": ["预期", "expected", "expected_result", "预期结果"]
 }
+
+
+@lru_cache(maxsize=1)
+def get_llm_config():
+    """根据环境变量加载模型提供商配置。"""
+    provider = os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER).strip().lower()
+
+    if provider not in SUPPORTED_PROVIDERS:
+        raise ValueError(
+            f"不支持的 LLM_PROVIDER: {provider}。支持的值：{', '.join(sorted(SUPPORTED_PROVIDERS))}"
+        )
+
+    if provider == "zhipu":
+        api_key = os.getenv("ZHIPU_API_KEY") or os.getenv("LLM_API_KEY")
+        api_url = os.getenv("ZHIPU_API_URL") or os.getenv("LLM_API_URL") or \
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        model = os.getenv("ZHIPU_MODEL") or os.getenv("LLM_MODEL") or "glm-4-flash"
+    else:
+        api_key = os.getenv("GITHUB_TOKEN") or os.getenv("LLM_API_KEY")
+        api_url = os.getenv("GITHUB_MODELS_API_URL") or os.getenv("LLM_API_URL")
+        model = os.getenv("GITHUB_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
+
+    if not api_key:
+        raise ValueError("未配置 API Key，请在 .env 中设置对应提供商的密钥")
+
+    if not api_url:
+        raise ValueError("未配置 API URL，请在 .env 中设置对应提供商的接口地址")
+
+    return {
+        "provider": provider,
+        "api_key": api_key,
+        "api_url": api_url,
+        "model": model
+    }
+
+
+def _strip_json_markdown(text):
+    """移除模型可能返回的 ```json 代码块包裹。"""
+    if not isinstance(text, str):
+        return text
+
+    content = text.strip()
+    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", content, flags=re.S | re.I)
+    return match.group(1).strip() if match else content
+
+
+def _extract_response_content(result):
+    """兼容提取 chat/completions 响应中的文本内容。"""
+    if not result.get("choices"):
+        return ""
+
+    message = result["choices"][0].get("message", {})
+    content = message.get("content", "")
+
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text" and item.get("text"):
+                    text_parts.append(item["text"])
+                elif isinstance(item.get("content"), str):
+                    text_parts.append(item["content"])
+        content = "\n".join(text_parts)
+
+    if isinstance(content, dict):
+        content = json.dumps(content, ensure_ascii=False)
+
+    return _strip_json_markdown(content)
+
+
+def _build_payload(title, provider, model, system_prompt):
+    """按不同提供商构造请求体。"""
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"用例标题：{title}"}
+        ],
+        "temperature": 0.2,
+        "max_tokens": 300
+    }
+
+    if provider == "zhipu":
+        payload.update({
+            "do_sample": False,
+            "top_p": 0.7,
+            "response_format": {"type": "json_object"}
+        })
+
+    return payload
 
 
 def map_fields(data):
@@ -120,7 +210,9 @@ def ensure_step_expectation_match(steps, expectations):
 
 
 def robust_json_parse(json_str):
-    """健壮地解析JSON字符串，处理包含换行符的情况"""
+    """解析JSON字符串，处理包含换行符的情况"""
+    json_str = _strip_json_markdown(json_str)
+
     try:
         # 尝试直接解析
         return json.loads(json_str)
@@ -159,6 +251,8 @@ def robust_json_parse(json_str):
 # ===== GLM-4 API调用函数 =====
 def generate_test_case_details(title):
     """根据标题生成测试用例详情（GLM-4版本）"""
+    config = get_llm_config()
+
     system_prompt = """
     你是专业的软件测试工程师，请根据用例标题严格按照以下JSON格式生成测试用例：
     {
@@ -176,25 +270,14 @@ def generate_test_case_details(title):
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {ZHIPU_API_KEY}"
+        "Authorization": f"Bearer {config['api_key']}"
     }
 
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"用例标题：{title}"}
-        ],
-        "do_sample": False,
-        "temperature": 0.2,
-        "top_p": 0.7,
-        "max_tokens": 300,
-        "response_format": {"type": "json_object"}
-    }
+    payload = _build_payload(title, config["provider"], config["model"], system_prompt)
 
     for attempt in range(3):  # 重试3次
         try:
-            response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+            response = requests.post(config["api_url"], headers=headers, json=payload, timeout=30)
             response.raise_for_status()
             result = response.json()
 
@@ -203,7 +286,7 @@ def generate_test_case_details(title):
                 print("❌ 模型未返回有效结果")
                 return _get_default_details()
 
-            content = result["choices"][0]["message"].get("content")
+            content = _extract_response_content(result)
             if not content:
                 print("❌ 响应内容为空")
                 return _get_default_details()
@@ -214,6 +297,9 @@ def generate_test_case_details(title):
 
             # 使用健壮的解析函数
             details = robust_json_parse(content)
+            if not details:
+                print("⚠️ JSON内容为空，使用默认值")
+                return _get_default_details()
 
             # 调试输出解析后的字段
             # print(f"\n=== 解析后的字段 ({title}) ===")
@@ -391,12 +477,15 @@ def freemind_to_cases(freemind_file, csv_file):
 
 # ===== 程序入口 =====
 if __name__ == "__main__":
-    if not ZHIPU_API_KEY:
-        print("❌ 请在.env文件中配置ZHIPU_API_KEY")
+    try:
+        llm_config = get_llm_config()
+    except ValueError as e:
+        print(f"❌ {e}")
         sys.exit(1)
 
     input_path = f"./FreeMindFiles/{FREEMIND_FILE}"
     output_path = f"./ExcelFiles/{FREEMIND_FILE.split('.')[0]}.csv"
 
     print(f"开始处理文件: {input_path}")
+    print(f"当前模型提供商: {llm_config['provider']} | 模型: {llm_config['model']}")
     freemind_to_cases(input_path, output_path)
