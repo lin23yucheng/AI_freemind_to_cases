@@ -13,11 +13,11 @@ from dotenv import load_dotenv
 
 load_dotenv()  # 加载环境变量
 
-# ===== GLM-4配置 =====
+# ===== LLM 配置 =====
 INCLUDE_PARENT = False  # 仅提取叶子节点
-FREEMIND_FILE = "一休云6-2需求测试点.mm"
-DEFAULT_PROVIDER = "zhipu"
-SUPPORTED_PROVIDERS = {"zhipu", "github", "openai_compatible"}
+FREEMIND_FILE = "VLA1-0测试点.mm"
+DEFAULT_PROVIDER = "deepseek"
+SUPPORTED_PROVIDERS = {"deepseek", "zhipu", "github", "openai_compatible"}
 
 cases_format = {
     "所属模块": "",
@@ -54,6 +54,11 @@ def get_llm_config():
         api_url = os.getenv("ZHIPU_API_URL") or os.getenv("LLM_API_URL") or \
             "https://open.bigmodel.cn/api/paas/v4/chat/completions"
         model = os.getenv("ZHIPU_MODEL") or os.getenv("LLM_MODEL") or "glm-4-flash"
+    elif provider == "deepseek":
+        api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY")
+        api_url = os.getenv("DEEPSEEK_API_URL") or os.getenv("LLM_API_URL") or \
+            "https://api.deepseek.com/chat/completions"
+        model = os.getenv("DEEPSEEK_MODEL") or os.getenv("LLM_MODEL") or "deepseek-v4-flash"
     else:
         api_key = os.getenv("GITHUB_TOKEN") or os.getenv("LLM_API_KEY")
         api_url = os.getenv("GITHUB_MODELS_API_URL") or os.getenv("LLM_API_URL")
@@ -115,15 +120,18 @@ def _build_payload(title, provider, model, system_prompt):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"用例标题：{title}"}
         ],
-        "temperature": 0.2,
-        "max_tokens": 300
+        "temperature": 0.1,
+        "max_tokens": 500
     }
 
+    if provider in {"zhipu", "deepseek"}:
+        payload.update({
+            "response_format": {"type": "json_object"}
+        })
     if provider == "zhipu":
         payload.update({
             "do_sample": False,
-            "top_p": 0.7,
-            "response_format": {"type": "json_object"}
+            "top_p": 0.7
         })
 
     return payload
@@ -209,8 +217,33 @@ def ensure_step_expectation_match(steps, expectations):
     return formatted_steps, formatted_expectations
 
 
+def _escape_control_characters_in_json_strings(text):
+    """转义 JSON 字符串内模型错误输出的原始控制字符。"""
+    escaped = []
+    in_string = False
+    is_escaped = False
+
+    for char in text:
+        if in_string and char == "\n":
+            escaped.append("\\n")
+        elif in_string and char == "\r":
+            escaped.append("\\r")
+        elif in_string and char == "\t":
+            escaped.append("\\t")
+        else:
+            escaped.append(char)
+
+        if char == '"' and not is_escaped:
+            in_string = not in_string
+        is_escaped = char == "\\" and not is_escaped
+        if char != "\\":
+            is_escaped = False
+
+    return "".join(escaped)
+
+
 def robust_json_parse(json_str):
-    """解析JSON字符串，处理包含换行符的情况"""
+    """解析模型返回的 JSON，并兼容字符串中的原始换行符。"""
     json_str = _strip_json_markdown(json_str)
 
     try:
@@ -219,53 +252,55 @@ def robust_json_parse(json_str):
     except json.JSONDecodeError as e:
         # print(f"⚠️ JSON解析失败: {e}")
 
-        # 尝试修复换行符问题
+        # 某些模型会在 JSON 字符串中输出原始换行符，修复后再解析。
         try:
-            # 查找并修复字符串值中的换行符
-            # 匹配: "key": "value\nwith newline" 并将其替换为 "key": "value\\nwith newline"
-            fixed_str = re.sub(r'"([^"\\]*(?:\\.[^"\\]*)*)"',
-                               lambda m: m.group(0).replace('\n', '\\n'),
-                               json_str)
-
+            fixed_str = _escape_control_characters_in_json_strings(json_str)
             return json.loads(fixed_str)
         except json.JSONDecodeError as e2:
             print(f"⚠️ 修复后仍无法解析: {e2}")
 
-            # 提取关键信息作为备用
+            # 按已知字段边界恢复缺少闭合引号的响应。
             try:
-                # 使用正则表达式提取前置条件、步骤和预期
-                precondition_match = re.search(r'"前置条件"\s*:\s*"([^"]+)"', json_str)
-                steps_match = re.search(r'"步骤"\s*:\s*"([^"]+)"', json_str)
-                expected_match = re.search(r'"预期"\s*:\s*"([^"]+)"', json_str)
+                fields = ("前置条件", "步骤", "预期")
+                recovered = {}
+                for index, field in enumerate(fields):
+                    next_fields = fields[index + 1:]
+                    boundaries = [rf'\s*,?\s*"{name}"\s*:' for name in next_fields]
+                    boundaries.append(r'\s*}\s*$')
+                    match = re.search(
+                        rf'"{field}"\s*:\s*"(.*?)(?={"|".join(boundaries)})',
+                        json_str,
+                        flags=re.S,
+                    )
+                    if match:
+                        recovered[field] = match.group(1).rstrip('"').strip()
 
-                return {
-                    "前置条件": precondition_match.group(1) if precondition_match else "",
-                    "步骤": steps_match.group(1) if steps_match else "",
-                    "预期": expected_match.group(1) if expected_match else ""
-                }
+                return recovered
             except Exception as e3:
                 print(f"❌ 无法提取任何信息: {e3}")
                 return {}
 
 
-# ===== GLM-4 API调用函数 =====
+# ===== LLM API 调用函数 =====
 def generate_test_case_details(title):
-    """根据标题生成测试用例详情（GLM-4版本）"""
+    """根据标题生成测试用例详情。"""
     config = get_llm_config()
 
     system_prompt = """
     你是专业的软件测试工程师，请根据用例标题严格按照以下JSON格式生成测试用例：
     {
         "前置条件": "系统已启动，用户已登录",
-        "步骤": "1. 打开功能页面\n2. 输入测试数据\n3. 点击提交按钮",
-        "预期": "1. 成功打开页面\n2. 数据正确输入\n3. 系统成功处理并提示操作成功"
+        "步骤": "1. 打开功能页面\\n2. 输入测试数据\\n3. 点击提交按钮",
+        "预期": "1. 成功打开页面\\n2. 数据正确输入\\n3. 系统成功处理并提示操作成功"
     }
 
     请确保：
-    1. 步骤和预期结果都使用数字序号（1., 2., 3.等）开头
-    2. 步骤和预期结果的数量必须一致，一一对应
-    3. 字段名与上述示例完全一致，不要添加其他字段
-    4. 字符串值中的换行符不需要转义（直接使用\n）
+    1. 每个字段内容保持简洁，步骤和预期结果各最多3项
+    2. 步骤和预期结果都使用数字序号（1., 2., 3.等）开头
+    3. 步骤和预期结果的数量必须一致，一一对应
+    4. 字段名与上述示例完全一致，不要添加其他字段
+    5. 必须返回一个可由 json.loads 直接解析的合法 JSON 对象，不要使用 Markdown 代码块
+    6. 步骤和预期中的换行必须在 JSON 字符串中写为 \\n，不能输出原始换行
     """
 
     headers = {
@@ -283,13 +318,14 @@ def generate_test_case_details(title):
 
             # 解析响应
             if not result.get("choices"):
-                print("❌ 模型未返回有效结果")
-                return _get_default_details()
+                print("⚠️ 模型未返回有效结果，准备重试")
+                continue
 
             content = _extract_response_content(result)
             if not content:
-                print("❌ 响应内容为空")
-                return _get_default_details()
+                finish_reason = result["choices"][0].get("finish_reason", "unknown")
+                print(f"⚠️ 响应内容为空（结束原因: {finish_reason}），准备重试")
+                continue
 
             # 调试输出原始响应
             # print(f"\n=== 原始响应 ({title}) ===")
@@ -298,8 +334,9 @@ def generate_test_case_details(title):
             # 使用健壮的解析函数
             details = robust_json_parse(content)
             if not details:
-                print("⚠️ JSON内容为空，使用默认值")
-                return _get_default_details()
+                finish_reason = result["choices"][0].get("finish_reason", "unknown")
+                print(f"⚠️ JSON无法解析（结束原因: {finish_reason}），准备重试")
+                continue
 
             # 调试输出解析后的字段
             # print(f"\n=== 解析后的字段 ({title}) ===")
