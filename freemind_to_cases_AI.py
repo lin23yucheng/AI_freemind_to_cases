@@ -16,7 +16,7 @@ load_dotenv()  # 加载环境变量
 
 # ===== LLM 配置 =====
 INCLUDE_PARENT = False  # 仅提取叶子节点
-FREEMIND_FILE = "测试效果.mm"
+FREEMIND_FILE = ".mm"
 DEFAULT_PROVIDER = "deepseek"
 SUPPORTED_PROVIDERS = {"deepseek", "zhipu", "github", "openai_compatible"}
 
@@ -49,9 +49,10 @@ JSON字段规范：
   \"operation_steps\": \"分步清晰的操作步骤\",
   \"expected_result\": \"明确可校验的预期结果\"
 }
-3. 区分正向、边界、异常场景；测试数据贴合测试点约束；
-4. 如果单个测试点可以拆分多条独立场景，可以输出多条JSON数组；
-5. 语言简洁，适配导入测试管理平台。
+3. operation_steps 与 expected_result 必须均使用从 1 开始的数字序号。两者条目数量必须严格相等，且第 N 条预期结果只能对应第 N 条操作步骤；不得合并步骤预期、不得遗漏任一步骤的预期结果。
+4. 区分正向、边界、异常场景；测试数据贴合测试点约束；
+5. 如果单个测试点可以拆分多条独立场景，可以输出多条JSON数组；
+6. 语言简洁，适配导入测试管理平台。
 【待处理测试点原文】：{{full_test_point_text}}"""
 
 cases_format = {
@@ -66,12 +67,10 @@ cases_format = {
     "适用阶段": "功能测试阶段"
 }
 
-# 新字段与原有导出字段并存，保证已有测试管理平台导入格式不受影响。
+# LLM 的英文键仅用于内部解析；导出保持原有测试管理平台中文字段。
 FULL_CASE_FIELDS = ["case_title", "precondition", "operation_steps", "expected_result"]
-# 保留每行用例的人工测试点来源，供审核 AI 是否遗漏或扩展规则。
-SOURCE_TEST_POINT_FIELD = "source_test_point"
-EXPORT_FIELDS = list(cases_format.keys()) + FULL_CASE_FIELDS
-EXPORT_FIELDS.append(SOURCE_TEST_POINT_FIELD)
+# 导出列仅保留原始字段，避免与 LLM 内部字段形成重复列。
+EXPORT_FIELDS = list(cases_format.keys())
 
 # 定义字段映射关系
 FIELD_MAPPING = {
@@ -299,7 +298,7 @@ def robust_json_parse(json_str):
             fixed_str = _escape_control_characters_in_json_strings(json_str)
             return json.loads(fixed_str)
         except json.JSONDecodeError as e2:
-            print(f"⚠️ 修复后仍无法解析: {e2}")
+            logger.debug("JSON 修复后仍无法解析: %s", e2)
 
             # 按已知字段边界恢复缺少闭合引号的响应。
             try:
@@ -319,7 +318,7 @@ def robust_json_parse(json_str):
 
                 return recovered
             except Exception as e3:
-                print(f"❌ 无法提取任何信息: {e3}")
+                logger.debug("无法提取任何 JSON 信息: %s", e3)
                 return {}
 
 
@@ -342,18 +341,60 @@ def _extract_json_value(text):
     return {}
 
 
-def _normalise_full_case_response(content):
-    """校验完整用例响应结构，只接受约定的四个字段。"""
+def _normalise_full_case_response(content, with_diagnostics=False):
+    """校验完整用例响应结构；诊断信息只描述格式，不包含用例正文。"""
     parsed = _extract_json_value(content)
+    if not parsed:
+        result = ([], "模型响应无法解析为 JSON 对象或 JSON 数组")
+        return result if with_diagnostics else result[0]
+
     items = parsed if isinstance(parsed, list) else [parsed]
     valid_cases = []
-    for item in items:
+    errors = []
+    for index, item in enumerate(items, start=1):
         if not isinstance(item, dict):
+            errors.append(f"第 {index} 项不是 JSON 对象")
             continue
         case = {field: str(item.get(field, "")).strip() for field in FULL_CASE_FIELDS}
-        if all(case.values()):
+        missing_fields = [field for field, value in case.items() if not value]
+        if missing_fields:
+            errors.append(f"第 {index} 项缺少字段：{', '.join(missing_fields)}")
+            continue
+        alignment_error = _get_step_expectation_alignment_error(
+            case["operation_steps"], case["expected_result"]
+        )
+        if not alignment_error:
             valid_cases.append(case)
-    return valid_cases
+        else:
+            errors.append(f"第 {index} 项{alignment_error}")
+
+    if valid_cases:
+        result = (valid_cases, "")
+    else:
+        result = ([], "；".join(errors) or "模型响应不包含有效用例")
+    return result if with_diagnostics else result[0]
+
+
+def _steps_and_expectations_are_aligned(operation_steps, expected_result):
+    """只接受编号连续、数量相同的步骤和预期，防止生成不成对的用例。"""
+    return not _get_step_expectation_alignment_error(operation_steps, expected_result)
+
+
+def _get_step_expectation_alignment_error(operation_steps, expected_result):
+    """返回不成对原因，仅含编号与数量，不记录具体用例内容。"""
+    number_pattern = r"(?m)^\s*(\d+)[.、)]\s+\S"
+    step_numbers = [int(number) for number in re.findall(number_pattern, operation_steps)]
+    expected_numbers = [int(number) for number in re.findall(number_pattern, expected_result)]
+    expected_sequence = list(range(1, len(step_numbers) + 1))
+    if not step_numbers:
+        return "操作步骤未使用连续数字编号"
+    if step_numbers != expected_sequence:
+        return f"操作步骤编号不连续（检测到 {step_numbers}）"
+    if len(expected_numbers) != len(step_numbers):
+        return f"步骤 {len(step_numbers)} 条、预期 {len(expected_numbers)} 条，数量不一致"
+    if expected_numbers != expected_sequence:
+        return f"预期结果编号不连续（检测到 {expected_numbers}）"
+    return ""
 
 
 def build_project_test_point_context(case_titles):
@@ -377,8 +418,6 @@ def llm_generate_complete_case(full_test_point_str):
     """按全图上下文及当前焦点测试点生成结构化用例；失败时返回空列表。"""
     focus_match = re.search(r"【当前焦点测试点】\s*(.*)$", full_test_point_str, flags=re.S)
     focused_test_point = focus_match.group(1).strip() if focus_match else full_test_point_str
-    logger.info("LLM当前焦点测试点：%s；全图上下文字符数：%s",
-                focused_test_point, len(full_test_point_str))
     if len(full_test_point_str) > LLM_CONTEXT_WARNING_CHARS:
         logger.warning("全图测试点上下文超过预警值 %s 字符，需使用支持足够上下文窗口的模型；内容未截断。",
                        LLM_CONTEXT_WARNING_CHARS)
@@ -397,25 +436,28 @@ def llm_generate_complete_case(full_test_point_str):
         "max_tokens": 1500,
     }
 
+    last_failure_reason = "未知错误"
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
             response = requests.post(config["api_url"], headers=headers, json=payload,
                                      timeout=LLM_TIMEOUT_SECONDS)
             response.raise_for_status()
             content = _extract_response_content(response.json())
-            cases = _normalise_full_case_response(content)
+            cases, invalid_reason = _normalise_full_case_response(content, with_diagnostics=True)
             if cases:
-                logger.info("LLM返回解析成功（焦点：%s）：生成 %s 条用例，响应长度 %s 字符",
-                            focused_test_point, len(cases), len(content))
+                logger.info("LLM返回解析成功：生成 %s 条用例，响应长度 %s 字符",
+                            len(cases), len(content))
                 return cases
-            logger.warning("LLM返回格式非法（第 %s/%s 次）", attempt, LLM_MAX_RETRIES)
+            # 中间重试静默处理，仅在最终失败时输出最后一次具体原因。
+            last_failure_reason = invalid_reason
         except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError) as exc:
-            logger.warning("LLM调用失败（第 %s/%s 次）：%s", attempt, LLM_MAX_RETRIES, exc)
+            last_failure_reason = f"LLM 请求或响应异常：{exc}"
 
         if attempt < LLM_MAX_RETRIES:
             time.sleep(2)
 
-    logger.error("LLM生成失败，保留当前焦点测试点：%s", focused_test_point)
+    logger.error("LLM生成失败，保留当前焦点测试点：%s；失败原因：%s",
+                 focused_test_point, last_failure_reason)
     return []
 
 
@@ -590,10 +632,9 @@ def _ensure_export_header(csv_file):
     if current_fields == EXPORT_FIELDS:
         return
 
-    # 原列顺序保留，新增列固定追加在末尾。
-    fields = current_fields + [field for field in EXPORT_FIELDS if field not in current_fields]
+    # 完整模式曾输出英文内部字段；迁移时仅保留原有测试管理平台字段。
     with open(csv_file, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=EXPORT_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -703,7 +744,6 @@ def freemind_to_cases(freemind_file, csv_file):
                     temp["步骤"] = generated_case["operation_steps"]
                     temp["预期"] = generated_case["expected_result"]
                     temp.update(generated_case)
-                    temp[SOURCE_TEST_POINT_FIELD] = data
                     writer.writerow(temp)
 
             # 记录断点
