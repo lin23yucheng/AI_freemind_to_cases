@@ -2,7 +2,6 @@ import sys
 import xml.etree.ElementTree as ET
 import csv
 import copy
-import random
 import os
 import requests
 import json
@@ -16,7 +15,7 @@ load_dotenv()  # 加载环境变量
 
 # ===== LLM 配置 =====
 INCLUDE_PARENT = False  # 仅提取叶子节点
-FREEMIND_FILE = ".mm"
+FREEMIND_FILE = "AI测试用例.mm"
 DEFAULT_PROVIDER = "deepseek"
 SUPPORTED_PROVIDERS = {"deepseek", "zhipu", "github", "openai_compatible"}
 
@@ -47,12 +46,19 @@ JSON字段规范：
   \"case_title\": \"精炼标准用例标题\",
   \"precondition\": \"预置/前置条件\",
   \"operation_steps\": \"分步清晰的操作步骤\",
-  \"expected_result\": \"明确可校验的预期结果\"
+  \"expected_result\": \"明确可校验的预期结果\",
+  \"priority\": \"1-4 之一\"
 }
 3. operation_steps 与 expected_result 必须均使用从 1 开始的数字序号。两者条目数量必须严格相等，且第 N 条预期结果只能对应第 N 条操作步骤；不得合并步骤预期、不得遗漏任一步骤的预期结果。
 4. 区分正向、边界、异常场景；测试数据贴合测试点约束；
 5. 如果单个测试点可以拆分多条独立场景，可以输出多条JSON数组；
 6. 语言简洁，适配导入测试管理平台。
+7. 每条用例必须给出 priority，且只能是字符串 \"1\"、\"2\"、\"3\" 或 \"4\"。结合当前焦点测试点、所在模块和已明确的全图上下文判断：
+   - 1：核心主链路阻断、明显安全风险、数据丢失/错误或系统不可用风险；
+   - 2：重要或高频功能、主要异常处理与关键业务规则；
+   - 3：一般功能验证、常规边界与低频异常场景；
+   - 4：仅影响展示、文案、样式或其他低影响体验的场景。
+   测试点没有足够信息时使用 \"2\"，不得根据未提供的业务信息臆测风险。
 【待处理测试点原文】：{{full_test_point_text}}"""
 
 cases_format = {
@@ -69,6 +75,8 @@ cases_format = {
 
 # LLM 的英文键仅用于内部解析；导出保持原有测试管理平台中文字段。
 FULL_CASE_FIELDS = ["case_title", "precondition", "operation_steps", "expected_result"]
+VALID_PRIORITIES = {"1", "2", "3", "4"}
+DEFAULT_PRIORITY = "2"
 # 导出列仅保留原始字段，避免与 LLM 内部字段形成重复列。
 EXPORT_FIELDS = list(cases_format.keys())
 
@@ -341,6 +349,15 @@ def _extract_json_value(text):
     return {}
 
 
+def normalise_priority(value):
+    """仅保留测试管理平台支持的 1 至 4 级优先级。"""
+    priority = str(value).strip()
+    if priority in VALID_PRIORITIES:
+        return priority
+    logger.warning("LLM 返回了无效优先级 %r，已使用默认优先级 %s", value, DEFAULT_PRIORITY)
+    return DEFAULT_PRIORITY
+
+
 def _normalise_full_case_response(content, with_diagnostics=False):
     """校验完整用例响应结构；诊断信息只描述格式，不包含用例正文。"""
     parsed = _extract_json_value(content)
@@ -364,6 +381,7 @@ def _normalise_full_case_response(content, with_diagnostics=False):
             case["operation_steps"], case["expected_result"]
         )
         if not alignment_error:
+            case["priority"] = normalise_priority(item.get("priority", DEFAULT_PRIORITY))
             valid_cases.append(case)
         else:
             errors.append(f"第 {index} 项{alignment_error}")
@@ -723,6 +741,7 @@ def freemind_to_cases(freemind_file, csv_file):
                     "precondition": f"[原始测试点] {data}",
                     "operation_steps": "[LLM生成失败，未生成操作步骤]",
                     "expected_result": "[LLM生成失败，未生成预期结果]",
+                    "priority": DEFAULT_PRIORITY,
                 }]
             if not enable_llm_generate_full_case:
                 generated_cases = [{
@@ -730,6 +749,7 @@ def freemind_to_cases(freemind_file, csv_file):
                     "precondition": "",
                     "operation_steps": "",
                     "expected_result": "",
+                    "priority": DEFAULT_PRIORITY,
                 }]
 
             # 数组响应按独立场景拆分为多行，旧字段同步写入以保持导入兼容。
@@ -739,7 +759,7 @@ def freemind_to_cases(freemind_file, csv_file):
                     temp = copy.deepcopy(cases_format)
                     temp["用例标题"] = generated_case["case_title"]
                     temp["所属模块"] = module
-                    temp["优先级"] = str(random.randint(1, 4))
+                    temp["优先级"] = normalise_priority(generated_case.get("priority"))
                     temp["前置条件"] = generated_case["precondition"]
                     temp["步骤"] = generated_case["operation_steps"]
                     temp["预期"] = generated_case["expected_result"]
